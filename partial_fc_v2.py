@@ -1,15 +1,25 @@
-
 import math
 from typing import Callable
 
 import torch
 from torch import distributed
 from torch.nn.functional import linear, normalize
+from persistent_homology import *
+from GUM import *
 
-def l2_norm(input,axis=1):
-    norm = torch.norm(input,2,axis,True)
+
+def Entropy(input_):
+    epsilon = 1e-5
+    entropy = -input_ * torch.log(input_ + epsilon)
+    entropy = torch.sum(entropy, dim=1)
+    return entropy
+
+
+def l2_norm(input, axis=1):
+    norm = torch.norm(input, 2, axis, True)
     output = torch.div(input, norm)
     return output
+
 
 class PartialFC_V2(torch.nn.Module):
     """
@@ -33,12 +43,12 @@ class PartialFC_V2(torch.nn.Module):
     _version = 2
 
     def __init__(
-        self,
-        margin_loss: Callable,
-        embedding_size: int,
-        num_classes: int,
-        sample_rate: float = 1.0,
-        fp16: bool = False,
+            self,
+            margin_loss: Callable,
+            embedding_size: int,
+            num_classes: int,
+            sample_rate: float = 1.0,
+            fp16: bool = False,
     ):
         """
         Paramenters:
@@ -111,9 +121,9 @@ class PartialFC_V2(torch.nn.Module):
         return self.weight[self.weight_index]
 
     def forward(
-        self,
-        local_embeddings: torch.Tensor,
-        local_labels: torch.Tensor,
+            self,
+            local_embeddings: torch.Tensor,
+            local_labels: torch.Tensor,
     ):
         """
         Parameters:
@@ -151,7 +161,7 @@ class PartialFC_V2(torch.nn.Module):
 
         labels = labels.view(-1, 1)
         index_positive = (self.class_start <= labels) & (
-            labels < self.class_start + self.num_local
+                labels < self.class_start + self.num_local
         )
         labels[~index_positive] = -1
         labels[index_positive] -= self.class_start
@@ -174,6 +184,158 @@ class PartialFC_V2(torch.nn.Module):
         logits = logits.clamp(-1 + self.eps, 1 - self.eps)
         logits = self.margin_softmax(logits, norms, labels)
         loss = self.dist_cross_entropy(logits, labels)
+        return loss
+
+
+class PartialFC_Topology(torch.nn.Module):
+
+    def __init__(
+            self,
+            margin_loss: Callable,
+            embedding_size: int,
+            num_classes: int,
+            sample_rate: float = 1.0,
+            fp16: bool = False,
+    ):
+        super(PartialFC_Topology, self).__init__()
+        assert (
+            distributed.is_initialized()
+        ), "must initialize distributed before create this"
+        self.rank = distributed.get_rank()
+        self.world_size = distributed.get_world_size()
+
+        self.dist_cross_entropy = DistCrossEntropy()
+        self.embedding_size = embedding_size
+        self.sample_rate: float = sample_rate
+        self.fp16 = fp16
+        self.num_local: int = num_classes // self.world_size + int(
+            self.rank < num_classes % self.world_size
+        )
+        self.class_start: int = num_classes // self.world_size * self.rank + min(
+            self.rank, num_classes % self.world_size
+        )
+        self.num_sample: int = int(self.sample_rate * self.num_local)
+        self.last_batch_size: int = 0
+
+        self.is_updated: bool = True
+        self.init_weight_update: bool = True
+        self.weight = torch.nn.Parameter(torch.normal(0, 0.01, (self.num_local, embedding_size)))
+
+        # margin_loss
+        if isinstance(margin_loss, Callable):
+            self.margin_softmax = margin_loss
+        else:
+            raise
+
+    def sample(self, labels, index_positive):
+        """
+            This functions will change the value of labels
+            Parameters:
+            -----------
+            labels: torch.Tensor
+                pass
+            index_positive: torch.Tensor
+                pass
+            optimizer: torch.optim.Optimizer
+                pass
+        """
+        with torch.no_grad():
+            positive = torch.unique(labels[index_positive], sorted=True).cuda()
+            if self.num_sample - positive.size(0) >= 0:
+                perm = torch.rand(size=[self.num_local]).cuda()
+                perm[positive] = 2.0
+                index = torch.topk(perm, k=self.num_sample)[1].cuda()
+                index = index.sort()[0].cuda()
+            else:
+                index = positive
+            self.weight_index = index
+
+            labels[index_positive] = torch.searchsorted(index, labels[index_positive])
+
+        return self.weight[self.weight_index]
+
+    def forward(
+            self,
+            img: torch.Tensor,
+            local_embeddings: torch.Tensor,
+            local_labels: torch.Tensor,
+    ):
+        """
+        Parameters:
+        ----------
+        local_embeddings: torch.Tensor
+            feature embeddings on each GPU(Rank).
+        local_labels: torch.Tensor
+            labels on each GPU(Rank).
+        Returns:
+        -------
+        loss: torch.Tensor
+            pass
+        """
+        local_labels.squeeze_()
+        local_labels = local_labels.long()
+
+        batch_size = local_embeddings.size(0)
+        if self.last_batch_size == 0:
+            self.last_batch_size = batch_size
+        assert self.last_batch_size == batch_size, (
+            f"last batch size do not equal current batch size: {self.last_batch_size} vs {batch_size}")
+
+        _gather_embeddings = [
+            torch.zeros((batch_size, self.embedding_size)).cuda()
+            for _ in range(self.world_size)
+        ]
+        _gather_labels = [
+            torch.zeros(batch_size).long().cuda() for _ in range(self.world_size)
+        ]
+        _list_embeddings = AllGather(local_embeddings, *_gather_embeddings)
+        distributed.all_gather(_gather_labels, local_labels)
+
+        embeddings = torch.cat(_list_embeddings)
+        labels = torch.cat(_gather_labels)
+
+        labels = labels.view(-1, 1)
+        index_positive = (self.class_start <= labels) & (
+                labels < self.class_start + self.num_local
+        )
+        labels[~index_positive] = -1
+        labels[index_positive] -= self.class_start
+
+        if self.sample_rate < 1:
+            weight = self.sample(labels, index_positive)
+        else:
+            weight = self.weight
+
+        with torch.cuda.amp.autocast(self.fp16):
+            norm_embeddings = normalize(embeddings)
+            norm_weight_activated = normalize(weight)
+            logits = linear(norm_embeddings, norm_weight_activated)
+        if self.fp16:
+            logits = logits.float()
+        logits = logits.clamp(-1, 1)
+
+        margin_logits = self.margin_softmax(logits, labels)
+        loss_cls_sample = self.dist_cross_entropy(margin_logits, labels)
+
+        softmax_gum = torch.nn.Softmax(dim=1)(margin_logits)
+        entropy = Entropy(softmax_gum)
+        entropy = entropy.cpu().detach().numpy()
+        entropy[2 * np.arange(len(entropy) // 2)] = -1 * entropy[2 * np.arange(len(entropy) // 2)]
+        sample_weight, GUM_pi, GUM_sigma = gauss_unif(entropy.reshape(-1, 1))
+        sample_weight = torch.tensor(sample_weight).cuda()
+
+        probability_gt = torch.ones_like(local_labels)
+        for i_ in range(local_labels.size()[0]):
+            j_ = local_labels[i_]
+            probability_gt[i_] = softmax_gum[i_][j_]
+
+        temp = 1
+        w1 = torch.pow((2 - sample_weight), temp)
+        w2 = (1 - probability_gt)
+        loss_topo = compute_topological_loss(img, norm_embeddings, use_grad=True)
+        loss_cls = (w1 * w2 * loss_cls_sample).mean()
+
+        loss = loss_cls + 0.1 * loss_topo
         return loss
 
 
@@ -268,4 +430,3 @@ class AllGatherFunc(torch.autograd.Function):
 
 
 AllGather = AllGatherFunc.apply
-
